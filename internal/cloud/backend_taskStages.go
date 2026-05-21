@@ -5,8 +5,11 @@ package cloud
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 
 	tfe "github.com/hashicorp/go-tfe"
@@ -58,6 +61,93 @@ func (b *Cloud) runTaskStages(ctx context.Context, client *tfe.Client, runId str
 	return taskStages, nil
 }
 
+// fetchTaskResultOutcomes fetches the outcomes for a task result from the API
+func (b *Cloud) fetchTaskResultOutcomes(ctx *IntegrationContext, taskResultID string) ([]*tfe.TaskResultOutcome, error) {
+	// Build the full URL
+	baseURL := b.client.BaseURL()
+	url := fmt.Sprintf("%s/task-results/%s/outcomes", baseURL.String(), taskResultID)
+
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx.StopContext, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add authorization header
+	req.Header.Set("Authorization", "Bearer "+b.Token)
+	req.Header.Set("Content-Type", "application/vnd.api+json")
+
+	// Make the request
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	// Read and parse response
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse JSON API response
+	var jsonResp struct {
+		Data []struct {
+			ID         string `json:"id"`
+			Type       string `json:"type"`
+			Attributes struct {
+				OutcomeID   string        `json:"outcome-id"`
+				Description string        `json:"description"`
+				Body        string        `json:"body"`
+				URL         string        `json:"url"`
+				Tags        []interface{} `json:"tags"`
+			} `json:"attributes"`
+			Links struct {
+				Self string `json:"self"`
+				Body string `json:"body"`
+			} `json:"links"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(bodyBytes, &jsonResp); err != nil {
+		return nil, err
+	}
+
+	// Convert to TaskResultOutcome objects
+	outcomes := make([]*tfe.TaskResultOutcome, len(jsonResp.Data))
+	for i, data := range jsonResp.Data {
+		// Use the body link as the URL if available
+		url := data.Attributes.URL
+		if url == "" && data.Links.Body != "" {
+			// Convert relative URL to absolute (body link already starts with /api/v2/)
+			baseURL := b.client.BaseURL()
+			// Remove trailing slash and /api/v2 from baseURL since body link includes it
+			baseStr := baseURL.String()
+			if len(baseStr) > 0 && baseStr[len(baseStr)-1] == '/' {
+				baseStr = baseStr[:len(baseStr)-1]
+			}
+			// Remove /api/v2 suffix if present
+			if len(baseStr) >= 7 && baseStr[len(baseStr)-7:] == "/api/v2" {
+				baseStr = baseStr[:len(baseStr)-7]
+			}
+			url = baseStr + data.Links.Body
+		}
+
+		outcomes[i] = &tfe.TaskResultOutcome{
+			OutcomeID:   data.Attributes.OutcomeID,
+			Description: data.Attributes.Description,
+			Body:        data.Attributes.Body,
+			URL:         url,
+		}
+	}
+
+	return outcomes, nil
+}
+
 func (b *Cloud) getTaskStageWithAllOptions(ctx *IntegrationContext, stageID string) (*tfe.TaskStage, error) {
 	options := tfe.TaskStageReadOptions{
 		Include: []tfe.TaskStageIncludeOpt{tfe.TaskStageTaskResults, tfe.PolicyEvaluationsTaskResults},
@@ -65,9 +155,19 @@ func (b *Cloud) getTaskStageWithAllOptions(ctx *IntegrationContext, stageID stri
 	stage, err := b.client.TaskStages.Read(ctx.StopContext, stageID, &options)
 	if err != nil {
 		return nil, b.generalError("Failed to retrieve task stage", err)
-	} else {
-		return stage, nil
 	}
+
+	// Fetch outcomes for native tasks using the outcomes endpoint
+	for i, taskResult := range stage.TaskResults {
+		if taskResult.TaskCategory == "native" {
+			outcomes, err := b.fetchTaskResultOutcomes(ctx, taskResult.ID)
+			if err == nil && outcomes != nil {
+				stage.TaskResults[i].TaskResultOutcomes = outcomes
+			}
+		}
+	}
+
+	return stage, nil
 }
 
 func (b *Cloud) runTaskStage(ctx *IntegrationContext, output IntegrationOutputWriter, stageID string) error {
@@ -84,6 +184,11 @@ func (b *Cloud) runTaskStage(ctx *IntegrationContext, output IntegrationOutputWr
 		summarizers = append(summarizers, s)
 	}
 
+	// Add native task summarizer
+	if s := newNativeTaskResultSummarizer(b, ts); s != nil {
+		summarizers = append(summarizers, s)
+	}
+
 	if s := newPolicyEvaluationSummarizer(b, ts); s != nil {
 		summarizers = append(summarizers, s)
 	}
@@ -95,6 +200,16 @@ func (b *Cloud) runTaskStage(ctx *IntegrationContext, output IntegrationOutputWr
 		stage, err := b.client.TaskStages.Read(ctx.StopContext, stageID, &options)
 		if err != nil {
 			return false, b.generalError("Failed to retrieve task stage", err)
+		}
+
+		// Fetch outcomes for native tasks using the outcomes endpoint
+		for i, taskResult := range stage.TaskResults {
+			if taskResult.TaskCategory == "native" {
+				outcomes, err := b.fetchTaskResultOutcomes(ctx, taskResult.ID)
+				if err == nil && outcomes != nil {
+					stage.TaskResults[i].TaskResultOutcomes = outcomes
+				}
+			}
 		}
 
 		switch stage.Status {
