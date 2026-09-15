@@ -43,8 +43,7 @@ type taskResultSummarizer struct {
 }
 
 func newTaskResultSummarizer(b *Cloud, ts *tfe.TaskStage) taskStageSummarizer {
-	runTasks := filterRunTaskResults(ts.TaskResults)
-	if len(runTasks) == 0 {
+	if len(ts.TaskResults) == 0 {
 		return nil
 	}
 	return &taskResultSummarizer{
@@ -53,25 +52,13 @@ func newTaskResultSummarizer(b *Cloud, ts *tfe.TaskStage) taskStageSummarizer {
 	}
 }
 
-func filterRunTaskResults(taskResults []*tfe.TaskResult) []*tfe.TaskResult {
-	var runTasks []*tfe.TaskResult
-	for _, task := range taskResults {
-		// Exclude native tasks (TaskCategory == "native")
-		if task.TaskCategory != "native" {
-			runTasks = append(runTasks, task)
-		}
-	}
-	return runTasks
-}
-
 func (trs *taskResultSummarizer) Summarize(context *IntegrationContext, output IntegrationOutputWriter, ts *tfe.TaskStage) (bool, *string, error) {
 	if trs.finished {
 		return false, nil, nil
 	}
 	trs.counter++
 
-	runTasks := filterRunTaskResults(ts.TaskResults)
-	counts := summarizeTaskResults(runTasks)
+	counts := summarizeTaskResults(ts.TaskResults)
 
 	if counts.pending != 0 && !isTerminalTaskStageStatus(ts.Status) {
 		pendingMessage := "%d tasks still pending, %d passed, %d failed ... "
@@ -102,7 +89,7 @@ func (trs *taskResultSummarizer) Summarize(context *IntegrationContext, output I
 	}
 
 	// Print out the summary
-	trs.runTasksWithTaskResults(output, runTasks, counts)
+	trs.runTasksWithTaskResults(output, ts.TaskResults, counts)
 
 	// Mark as finished
 	trs.finished = true
