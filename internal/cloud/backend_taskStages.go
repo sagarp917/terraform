@@ -26,6 +26,12 @@ To view this run in a browser, visit:
 https://%s/app/%s/%s/runs/%s
 `
 
+// runURL returns the browser URL for the given run, e.g.
+// https://app.terraform.io/app/my-org/my-workspace/runs/run-abc123.
+func (b *Cloud) runURL(workspace, runID string) string {
+	return fmt.Sprintf("https://%s/app/%s/%s/runs/%s", b.Hostname, b.Organization, workspace, runID)
+}
+
 type taskStageSummarizer interface {
 	// Summarize takes an IntegrationContext, IntegrationOutputWriter for
 	// writing output and a pointer to a tfe.TaskStage object as arguments.
@@ -94,6 +100,10 @@ func (b *Cloud) runTaskStage(ctx *IntegrationContext, output IntegrationOutputWr
 	}
 
 	if s := newPolicyEvaluationSummarizer(b, ts); s != nil {
+		summarizers = append(summarizers, s)
+	}
+
+	if s := newNativeTaskSummarizer(b, ts); s != nil {
 		summarizers = append(summarizers, s)
 	}
 

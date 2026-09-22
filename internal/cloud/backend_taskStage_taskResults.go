@@ -4,8 +4,9 @@
 package cloud
 
 import (
+	"context"
 	"fmt"
-	"strings"
+	"unicode"
 
 	"github.com/hashicorp/go-tfe"
 )
@@ -40,6 +41,10 @@ type taskResultSummarizer struct {
 	finished bool
 	cloud    *Cloud
 	counter  int
+	// nativeCache memoizes hasNativeCLISummary results keyed by task result ID.
+	// The outcomes endpoint is called at most once per task result instead of
+	// on every poll tick.
+	nativeCache map[string]bool
 }
 
 func newTaskResultSummarizer(b *Cloud, ts *tfe.TaskStage) taskStageSummarizer {
@@ -47,12 +52,12 @@ func newTaskResultSummarizer(b *Cloud, ts *tfe.TaskStage) taskStageSummarizer {
 		return nil
 	}
 	return &taskResultSummarizer{
-		finished: false,
-		cloud:    b,
+		cloud:       b,
+		nativeCache: make(map[string]bool),
 	}
 }
 
-func (trs *taskResultSummarizer) Summarize(context *IntegrationContext, output IntegrationOutputWriter, ts *tfe.TaskStage) (bool, *string, error) {
+func (trs *taskResultSummarizer) Summarize(ctx *IntegrationContext, output IntegrationOutputWriter, ts *tfe.TaskStage) (bool, *string, error) {
 	if trs.finished {
 		return false, nil, nil
 	}
@@ -75,7 +80,7 @@ func (trs *taskResultSummarizer) Summarize(context *IntegrationContext, output I
 		}
 
 		completedCounts := summarizeTaskResults(completed)
-		trs.runTasksWithTaskResults(output, completed, completedCounts)
+		trs.runTasksWithTaskResults(ctx.StopContext, output, completed, completedCounts)
 		output.Output(fmt.Sprintf("Skipping %d pending task result(s) because task stage is %s.", len(pending), ts.Status))
 		output.End()
 		trs.finished = true
@@ -89,7 +94,7 @@ func (trs *taskResultSummarizer) Summarize(context *IntegrationContext, output I
 	}
 
 	// Print out the summary
-	trs.runTasksWithTaskResults(output, ts.TaskResults, counts)
+	trs.runTasksWithTaskResults(ctx.StopContext, output, ts.TaskResults, counts)
 
 	// Mark as finished
 	trs.finished = true
@@ -126,7 +131,7 @@ func summarizeTaskResults(taskResults []*tfe.TaskResult) *taskResultSummary {
 	}
 }
 
-func (trs *taskResultSummarizer) runTasksWithTaskResults(output IntegrationOutputWriter, taskResults []*tfe.TaskResult, count *taskResultSummary) {
+func (trs *taskResultSummarizer) runTasksWithTaskResults(ctx context.Context, output IntegrationOutputWriter, taskResults []*tfe.TaskResult, count *taskResultSummary) {
 	// Track the first task name that is a mandatory enforcement level breach.
 	var firstMandatoryTaskFailed *string = nil
 
@@ -138,15 +143,33 @@ func (trs *taskResultSummarizer) runTasksWithTaskResults(output IntegrationOutpu
 
 	output.Output("")
 
+	// renderedAny tracks whether at least one non-native task row was printed.
+	// If every task in the stage is a native task, nativeTaskSummarizer owns
+	// the per-task blocks, so we suppress the generic overall-result footer.
+	renderedAny := false
 	for _, t := range taskResults {
-		capitalizedStatus := string(t.Status)
-		capitalizedStatus = strings.ToUpper(capitalizedStatus[:1]) + capitalizedStatus[1:]
+		// Native tasks own their own CLI output block; skip them here so
+		// nativeTaskSummarizer can render the full INSIGHTS display.
+		// isNative is memoized: the outcomes endpoint is called at most once
+		// per task result ID across all poll ticks.
+		isNative, ok := trs.nativeCache[t.ID]
+		if !ok {
+			isNative = trs.cloud.hasNativeCLISummary(ctx, t.ID)
+			trs.nativeCache[t.ID] = isNative
+		}
+		if isNative {
+			if t.Status != "passed" && t.WorkspaceTaskEnforcementLevel == "mandatory" && firstMandatoryTaskFailed == nil {
+				firstMandatoryTaskFailed = &t.TaskName
+			}
+			continue
+		}
+
+		renderedAny = true
+		capitalizedStatus := capitalize(string(t.Status))
 
 		status := "[green]" + capitalizedStatus
 		if t.Status != "passed" {
-			level := string(t.WorkspaceTaskEnforcementLevel)
-			level = strings.ToUpper(level[:1]) + level[1:]
-			status = fmt.Sprintf("[red]%s (%s)", capitalizedStatus, level)
+			status = fmt.Sprintf("[red]%s (%s)", capitalizedStatus, capitalize(string(t.WorkspaceTaskEnforcementLevel)))
 
 			if t.WorkspaceTaskEnforcementLevel == "mandatory" && firstMandatoryTaskFailed == nil {
 				firstMandatoryTaskFailed = &t.TaskName
@@ -163,6 +186,12 @@ func (trs *taskResultSummarizer) runTasksWithTaskResults(output IntegrationOutpu
 			output.SubOutput(fmt.Sprintf("[dim]Details: %s", t.URL))
 		}
 		output.SubOutput("")
+	}
+
+	// Every task was a native task — nativeTaskSummarizer owns the output.
+	// Skip the generic footer so there's no orphaned "Overall Result" line.
+	if !renderedAny {
+		return
 	}
 
 	// If a mandatory enforcement level is breached, return an error.
@@ -182,4 +211,15 @@ func (trs *taskResultSummarizer) runTasksWithTaskResults(output IntegrationOutpu
 	output.SubOutput("[bold]Overall Result: " + overall)
 
 	output.End()
+}
+
+// capitalize upper-cases the first rune of s and returns the result.
+// Returns s unchanged if s is empty.
+func capitalize(s string) string {
+	runes := []rune(s)
+	if len(runes) == 0 {
+		return s
+	}
+	runes[0] = unicode.ToUpper(runes[0])
+	return string(runes)
 }
