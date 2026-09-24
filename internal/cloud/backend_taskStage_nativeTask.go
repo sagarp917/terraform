@@ -6,6 +6,8 @@ package cloud
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -21,6 +23,14 @@ const (
 	tagKeyCLIDisplayTitle   = "cli_display_title"
 	tagKeyCLIPrimaryDisplay = "cli_primary_display"
 	tagKeyStatus            = "status"
+	// tagKeyCLIErrorOnly suppresses the "Overall result" and "INSIGHTS" headers
+	// when every display outcome carries this tag (e.g. auth failure, service
+	// unreachable). The error block is rendered directly in that case.
+	tagKeyCLIErrorOnly = "cli_error_only"
+	// tagKeyCLIOrder controls the INSIGHTS display order. Its label is a
+	// non-negative integer string set by tfc-agent; lower values appear first.
+	// Outcomes without this tag sort after all ordered ones.
+	tagKeyCLIOrder = "cli_order"
 )
 
 // nativeTaskSummarizer renders CLI summary output for any native integration
@@ -196,7 +206,7 @@ func renderNativeTaskFallback(output IntegrationOutputWriter, taskResult *tfe.Ta
 // have not opted in are unaffected and the block is suppressed entirely when
 // no outcome has cli_display data.
 //
-// Layout:
+// Normal layout (partial errors or success):
 //
 //	------------------------------------------------------------------------
 //	<TaskName>
@@ -211,12 +221,39 @@ func renderNativeTaskFallback(output IntegrationOutputWriter, taskResult *tfe.Ta
 //	  | <remaining display lines>
 //
 //	------------------------------------------------------------------------
+//
+// Error-only layout (all outcomes carry "cli_error_only" tag — e.g. auth failure):
+//
+//	------------------------------------------------------------------------
+//	<TaskName>
+//	Running complete!
+//
+//	  | <error lines>
+//
+//	------------------------------------------------------------------------
 func renderNativeTaskSummary(output IntegrationOutputWriter, taskResult *tfe.TaskResult, outcomes outcomeList, runURL string) bool {
 	type displayOutcome struct {
 		attr         tfev2models.TaskResultOutcomes_attributesable
 		title        string
 		lines        []tfev2models.TaskResultOutcomes_attributes_tags_valueable
 		primaryLines []tfev2models.TaskResultOutcomes_attributes_tags_valueable
+	}
+
+	// cliOrderTag reads the cli_order tag label from an outcome's attribute set
+	// and returns (value, true) when the tag is present and parseable.
+	cliOrderTag := func(attr tfev2models.TaskResultOutcomes_attributesable) (int, bool) {
+		tag := findTagByLabel(attr.GetTags(), tagKeyCLIOrder)
+		if tag == nil {
+			return 0, false
+		}
+		for _, v := range tag.GetValue() {
+			if v != nil && v.GetLabel() != nil {
+				if n, err := strconv.Atoi(*v.GetLabel()); err == nil {
+					return n, true
+				}
+			}
+		}
+		return 0, false
 	}
 
 	// Single pass: collect display lines, primary lines, and title per outcome.
@@ -245,26 +282,79 @@ func renderNativeTaskSummary(output IntegrationOutputWriter, taskResult *tfe.Tas
 		return false
 	}
 
+	// Sort by cli_order tag; outcomes without it sort after those that have it,
+	// preserving arrival order within each group.
+	sort.SliceStable(displayOutcomes, func(i, j int) bool {
+		rankI, okI := cliOrderTag(displayOutcomes[i].attr)
+		rankJ, okJ := cliOrderTag(displayOutcomes[j].attr)
+		if okI && okJ {
+			return rankI < rankJ
+		}
+		if okI {
+			return true // i is ordered, j is not → i comes first
+		}
+		if okJ {
+			return false // j is ordered, i is not → j comes first
+		}
+		return false // neither ordered: preserve relative order
+	})
+
 	// cli.Ui.Output() appends its own newline — never add \n to Output() calls.
 
 	output.Output("------------------------------------------------------------------------")
 	output.Output(fmt.Sprintf("[bold]%s[reset]", taskResult.TaskName))
-	output.Output("Task complete.")
-	output.Output("")
 
-	// Overall pass/fail from the "status" tag across all outcomes.
-	overallPassed := true
+	// Error-only layout: suppress "Overall result" and "INSIGHTS" headers when
+	// every display outcome carries the cli_error_only tag. This matches the
+	// design for general errors (auth failure, service unreachable) where no
+	// API data was retrieved and the structured INSIGHTS block adds no value.
+	errorOnly := true
 	for _, do := range displayOutcomes {
-		status, _ := outcomeStatus(do.attr.GetTags())
-		if isFailureStatus(status) {
-			overallPassed = false
+		if findTagByLabel(do.attr.GetTags(), tagKeyCLIErrorOnly) == nil {
+			errorOnly = false
 			break
 		}
 	}
-	if overallPassed {
+	if errorOnly {
+		output.Output("[dim]Running complete![reset]")
+		output.Output("")
+		for _, do := range displayOutcomes {
+			renderTagValueLines(output, do.lines)
+		}
+		output.Output("")
+		output.Output("------------------------------------------------------------------------")
+		if runURL != "" {
+			output.Output("")
+			output.SubOutput("To view this run in a browser, visit:")
+			output.SubOutput(fmt.Sprintf("[dim]%s[reset]", runURL))
+			output.Output("")
+		}
+		return true
+	}
+
+	output.Output("Task complete.")
+	output.Output("")
+
+	// Overall status: derive the worst status across all outcomes.
+	// Priority: errored > failed > passed (absent = passed).
+	// This ensures "ERRORED" shows when any outcome has status:"errored",
+	// "FAILED" when any has status:"failed", and "PASSED" only when all pass.
+	overallStatus := ""
+	for _, do := range displayOutcomes {
+		status, _ := outcomeStatus(do.attr.GetTags())
+		switch strings.ToLower(status) {
+		case "errored", "error":
+			overallStatus = "errored" // highest severity — stop looking
+		case "failed":
+			if overallStatus != "errored" {
+				overallStatus = "failed"
+			}
+		}
+	}
+	if overallStatus == "" {
 		output.Output(fmt.Sprintf("%c%c  [bold]Overall result:[reset] [green]%c PASSED[reset]", Arrow, Arrow, Tick))
 	} else {
-		output.Output(fmt.Sprintf("%c%c  [bold]Overall result:[reset] [red]%c FAILED[reset]", Arrow, Arrow, Cross))
+		output.Output(fmt.Sprintf("%c%c  [bold]Overall result:[reset] [red]%c %s[reset]", Arrow, Arrow, Cross, strings.ToUpper(overallStatus)))
 	}
 
 	// Render primary metrics (e.g. cost_estimates) directly below Overall result.
