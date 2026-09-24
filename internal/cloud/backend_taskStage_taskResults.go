@@ -6,7 +6,7 @@ package cloud
 import (
 	"context"
 	"fmt"
-	"unicode"
+	"strings"
 
 	"github.com/hashicorp/go-tfe"
 )
@@ -52,12 +52,13 @@ func newTaskResultSummarizer(b *Cloud, ts *tfe.TaskStage) taskStageSummarizer {
 		return nil
 	}
 	return &taskResultSummarizer{
+		finished:    false,
 		cloud:       b,
 		nativeCache: make(map[string]bool),
 	}
 }
 
-func (trs *taskResultSummarizer) Summarize(ctx *IntegrationContext, output IntegrationOutputWriter, ts *tfe.TaskStage) (bool, *string, error) {
+func (trs *taskResultSummarizer) Summarize(context *IntegrationContext, output IntegrationOutputWriter, ts *tfe.TaskStage) (bool, *string, error) {
 	if trs.finished {
 		return false, nil, nil
 	}
@@ -80,7 +81,7 @@ func (trs *taskResultSummarizer) Summarize(ctx *IntegrationContext, output Integ
 		}
 
 		completedCounts := summarizeTaskResults(completed)
-		trs.runTasksWithTaskResults(ctx.StopContext, output, completed, completedCounts)
+		trs.runTasksWithTaskResults(context.StopContext, output, completed, completedCounts)
 		output.Output(fmt.Sprintf("Skipping %d pending task result(s) because task stage is %s.", len(pending), ts.Status))
 		output.End()
 		trs.finished = true
@@ -94,7 +95,7 @@ func (trs *taskResultSummarizer) Summarize(ctx *IntegrationContext, output Integ
 	}
 
 	// Print out the summary
-	trs.runTasksWithTaskResults(ctx.StopContext, output, ts.TaskResults, counts)
+	trs.runTasksWithTaskResults(context.StopContext, output, ts.TaskResults, counts)
 
 	// Mark as finished
 	trs.finished = true
@@ -165,11 +166,14 @@ func (trs *taskResultSummarizer) runTasksWithTaskResults(ctx context.Context, ou
 		}
 
 		renderedAny = true
-		capitalizedStatus := capitalize(string(t.Status))
+		capitalizedStatus := string(t.Status)
+		capitalizedStatus = strings.ToUpper(capitalizedStatus[:1]) + capitalizedStatus[1:]
 
 		status := "[green]" + capitalizedStatus
 		if t.Status != "passed" {
-			status = fmt.Sprintf("[red]%s (%s)", capitalizedStatus, capitalize(string(t.WorkspaceTaskEnforcementLevel)))
+			level := string(t.WorkspaceTaskEnforcementLevel)
+			level = strings.ToUpper(level[:1]) + level[1:]
+			status = fmt.Sprintf("[red]%s (%s)", capitalizedStatus, level)
 
 			if t.WorkspaceTaskEnforcementLevel == "mandatory" && firstMandatoryTaskFailed == nil {
 				firstMandatoryTaskFailed = &t.TaskName
@@ -213,13 +217,3 @@ func (trs *taskResultSummarizer) runTasksWithTaskResults(ctx context.Context, ou
 	output.End()
 }
 
-// capitalize upper-cases the first rune of s and returns the result.
-// Returns s unchanged if s is empty.
-func capitalize(s string) string {
-	runes := []rune(s)
-	if len(runes) == 0 {
-		return s
-	}
-	runes[0] = unicode.ToUpper(runes[0])
-	return string(runes)
-}
