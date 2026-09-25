@@ -41,20 +41,17 @@ type taskResultSummarizer struct {
 	finished bool
 	cloud    *Cloud
 	counter  int
-	// nativeCache memoizes hasNativeCLISummary results keyed by task result ID.
-	// The outcomes endpoint is called at most once per task result instead of
-	// on every poll tick.
-	nativeCache map[string]bool
+	native   *nativeTaskSummarizer
 }
 
-func newTaskResultSummarizer(b *Cloud, ts *tfe.TaskStage) taskStageSummarizer {
+func newTaskResultSummarizer(b *Cloud, ts *tfe.TaskStage, native *nativeTaskSummarizer) taskStageSummarizer {
 	if len(ts.TaskResults) == 0 {
 		return nil
 	}
 	return &taskResultSummarizer{
-		finished:    false,
-		cloud:       b,
-		nativeCache: make(map[string]bool),
+		finished: false,
+		cloud:    b,
+		native:   native,
 	}
 }
 
@@ -135,6 +132,25 @@ func summarizeTaskResults(taskResults []*tfe.TaskResult) *taskResultSummary {
 func (trs *taskResultSummarizer) runTasksWithTaskResults(ctx context.Context, output IntegrationOutputWriter, taskResults []*tfe.TaskResult, count *taskResultSummary) {
 	// Track the first task name that is a mandatory enforcement level breach.
 	var firstMandatoryTaskFailed *string = nil
+	renderableTaskResults := make([]*tfe.TaskResult, 0, len(taskResults))
+	for _, t := range taskResults {
+		// Native tasks own their own CLI output block only after the native
+		// summarizer has rendered them from cli_display outcome tags. Regular run
+		// tasks stay entirely on the existing generic path.
+		if trs.native.renderedTaskResult(t.ID) {
+			continue
+		}
+		renderableTaskResults = append(renderableTaskResults, t)
+	}
+
+	// Every task was a rendered native task — nativeTaskSummarizer owns the output.
+	if len(renderableTaskResults) == 0 {
+		return
+	}
+
+	if len(renderableTaskResults) != len(taskResults) {
+		count = summarizeTaskResults(renderableTaskResults)
+	}
 
 	if trs.counter == 0 {
 		output.Output(fmt.Sprintf("All tasks completed! %d passed, %d failed", count.passed, count.failed))
@@ -144,28 +160,7 @@ func (trs *taskResultSummarizer) runTasksWithTaskResults(ctx context.Context, ou
 
 	output.Output("")
 
-	// renderedAny tracks whether at least one non-native task row was printed.
-	// If every task in the stage is a native task, nativeTaskSummarizer owns
-	// the per-task blocks, so we suppress the generic overall-result footer.
-	renderedAny := false
-	for _, t := range taskResults {
-		// Native tasks own their own CLI output block; skip them here so
-		// nativeTaskSummarizer can render the full INSIGHTS display.
-		// isNative is memoized: the outcomes endpoint is called at most once
-		// per task result ID across all poll ticks.
-		isNative, ok := trs.nativeCache[t.ID]
-		if !ok {
-			isNative = trs.cloud.hasNativeCLISummary(ctx, t.ID)
-			trs.nativeCache[t.ID] = isNative
-		}
-		if isNative {
-			if t.Status != "passed" && t.WorkspaceTaskEnforcementLevel == "mandatory" && firstMandatoryTaskFailed == nil {
-				firstMandatoryTaskFailed = &t.TaskName
-			}
-			continue
-		}
-
-		renderedAny = true
+	for _, t := range renderableTaskResults {
 		capitalizedStatus := string(t.Status)
 		capitalizedStatus = strings.ToUpper(capitalizedStatus[:1]) + capitalizedStatus[1:]
 
@@ -192,12 +187,6 @@ func (trs *taskResultSummarizer) runTasksWithTaskResults(ctx context.Context, ou
 		output.SubOutput("")
 	}
 
-	// Every task was a native task — nativeTaskSummarizer owns the output.
-	// Skip the generic footer so there's no orphaned "Overall Result" line.
-	if !renderedAny {
-		return
-	}
-
 	// If a mandatory enforcement level is breached, return an error.
 	var overall string = "[green]Passed"
 	if firstMandatoryTaskFailed != nil {
@@ -216,4 +205,3 @@ func (trs *taskResultSummarizer) runTasksWithTaskResults(ctx context.Context, ou
 
 	output.End()
 }
-

@@ -6,6 +6,7 @@ package cloud
 import (
 	"context"
 	"fmt"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,15 +41,26 @@ const (
 // tag/outcome names. With the Atlas tag limit raised to 10, all integrations
 // have room to set both tags alongside their own structural tags.
 type nativeTaskSummarizer struct {
-	cloud    *Cloud
-	finished bool
+	cloud           *Cloud
+	finished        bool
+	renderedTaskIDs map[string]bool
 }
 
-func newNativeTaskSummarizer(b *Cloud, ts *tfe.TaskStage) taskStageSummarizer {
+func newNativeTaskSummarizer(b *Cloud, ts *tfe.TaskStage) *nativeTaskSummarizer {
 	if b.clientV2 == nil || len(ts.TaskResults) == 0 {
 		return nil
 	}
-	return &nativeTaskSummarizer{cloud: b}
+	return &nativeTaskSummarizer{
+		cloud:           b,
+		renderedTaskIDs: make(map[string]bool),
+	}
+}
+
+func (s *nativeTaskSummarizer) renderedTaskResult(taskResultID string) bool {
+	if s == nil {
+		return false
+	}
+	return s.renderedTaskIDs[taskResultID]
 }
 
 func (s *nativeTaskSummarizer) Summarize(
@@ -68,13 +80,11 @@ func (s *nativeTaskSummarizer) Summarize(
 	for _, taskResult := range stage.TaskResults {
 		outcomes, err := fetchTaskResultOutcomes(ctx.StopContext, s.cloud, taskResult.ID)
 		if err != nil {
-			return false, nil, fmt.Errorf("fetching outcomes for task %q: %w", taskResult.TaskName, err)
+			log.Printf("[WARN] cloud: failed to fetch native task outcomes for task result %q: %s", taskResult.ID, err)
+			continue
 		}
-		if !renderNativeTaskSummary(output, taskResult, outcomes, runURL) {
-			// No cli_display tags yet (tfc-agent not yet deployed with CLI
-			// summary support). Fall back to a minimal structural block so the
-			// task result is never silently swallowed.
-			renderNativeTaskFallback(output, taskResult, outcomes)
+		if renderNativeTaskSummary(output, taskResult, outcomes, runURL) {
+			s.renderedTaskIDs[taskResult.ID] = true
 		}
 	}
 
@@ -100,102 +110,6 @@ func fetchTaskResultOutcomes(ctx context.Context, cloud *Cloud, taskResultID str
 		return nil, nil
 	}
 	return response.GetData(), nil
-}
-
-// hasNativeCLISummary reports whether this task result is a native integration
-// task whose display is owned by nativeTaskSummarizer, so the generic
-// taskResultSummarizer can skip it and avoid printing a duplicate block.
-//
-// A task result is considered native when the v2 outcomes endpoint returns at
-// least one outcome — the presence of any outcome means tfc-agent posted a
-// structured result and nativeTaskSummarizer will render the INSIGHTS block.
-// We do NOT require the cli_display tag here: that tag may be absent on older
-// tfc-agent deployments, but the native task's display block is still rendered
-// (or gracefully suppressed) by nativeTaskSummarizer.
-//
-// During the running phase tfc-agent may not yet have posted any outcomes, so
-// this function returns false. taskResultSummarizer therefore prints a generic
-// progress row for the in-flight task, which is correct: the native INSIGHTS
-// block is rendered later by nativeTaskSummarizer once the stage reaches a
-// terminal status. taskResultSummarizer caches this result so the endpoint is
-// called at most once per task result ID regardless of how many poll ticks fire.
-func (b *Cloud) hasNativeCLISummary(ctx context.Context, taskResultID string) bool {
-	outcomes, err := fetchTaskResultOutcomes(ctx, b, taskResultID)
-	if err != nil {
-		return false
-	}
-	for _, o := range outcomes {
-		if o != nil && o.GetAttributes() != nil && o.GetAttributes().GetOutcomeId() != nil {
-			return true
-		}
-	}
-	return false
-}
-
-// renderNativeTaskFallback renders a minimal block for a native task when no
-// outcome carries a cli_display tag. It shows the task name, overall result
-// derived from the task-result status, and a brief per-outcome INSIGHTS list
-// using outcome_id and the status tag as the only available data.
-func renderNativeTaskFallback(output IntegrationOutputWriter, taskResult *tfe.TaskResult, outcomes outcomeList) {
-	output.Output("------------------------------------------------------------------------")
-	output.Output(fmt.Sprintf("[bold]%s[reset]", taskResult.TaskName))
-	output.Output("Task complete.")
-	output.Output("")
-
-	passed := taskResult.Status == tfe.TaskPassed
-	if passed {
-		output.Output(fmt.Sprintf("%c%c  [bold]Overall result:[reset] [green]%c PASSED[reset]", Arrow, Arrow, Tick))
-	} else {
-		output.Output(fmt.Sprintf("%c%c  [bold]Overall result:[reset] [red]%c FAILED[reset]", Arrow, Arrow, Cross))
-	}
-
-	if len(taskResult.Message) > 0 {
-		output.Output("")
-		output.Output(fmt.Sprintf("[dim]%s[reset]", taskResult.Message))
-	}
-	if len(taskResult.URL) > 0 {
-		output.Output(fmt.Sprintf("[dim]Details: %s[reset]", taskResult.URL))
-	}
-
-	// Build the INSIGHTS list, skipping outcomes with no tags — those are
-	// Atlas-pre-created placeholders that tfc-agent never populated.
-	var insightOutcomes []tfev2models.TaskResultOutcomesable
-	for _, outcome := range outcomes {
-		if outcome == nil || outcome.GetAttributes() == nil || outcome.GetAttributes().GetOutcomeId() == nil {
-			continue
-		}
-		if len(outcome.GetAttributes().GetTags()) == 0 {
-			continue
-		}
-		insightOutcomes = append(insightOutcomes, outcome)
-	}
-
-	if len(insightOutcomes) > 0 {
-		output.Output("")
-		output.Output("------------------------------------------------------------------------")
-		output.Output("[bold]INSIGHTS[reset]")
-		output.Output("")
-		for _, outcome := range insightOutcomes {
-			attr := outcome.GetAttributes()
-			title := displayLabel(*attr.GetOutcomeId())
-			status, statusLevel := outcomeStatus(attr.GetTags())
-			if status == "" {
-				output.Output(fmt.Sprintf("[bold]%s[reset]", title))
-			} else {
-				symbol := Tick
-				if isFailureStatus(status) {
-					symbol = Cross
-				}
-				output.Output(fmt.Sprintf("[bold]%s:[reset] %s%c %s[reset]", title, colorForStatus(status, statusLevel), symbol, strings.ToUpper(status)))
-			}
-			if detailsURL := attr.GetUrl(); detailsURL != nil && *detailsURL != "" {
-				output.SubOutput(fmt.Sprintf("[dim]Details: %s[reset]", *detailsURL))
-			}
-			output.Output("")
-		}
-	}
-
-	output.Output("------------------------------------------------------------------------")
 }
 
 // renderNativeTaskSummary produces a self-contained CLI summary block for a

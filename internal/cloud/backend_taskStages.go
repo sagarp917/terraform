@@ -95,15 +95,16 @@ func (b *Cloud) runTaskStage(ctx *IntegrationContext, output IntegrationOutputWr
 		return err
 	}
 
-	if s := newTaskResultSummarizer(b, ts); s != nil {
+	nativeSummarizer := newNativeTaskSummarizer(b, ts)
+	if nativeSummarizer != nil {
+		summarizers = append(summarizers, nativeSummarizer)
+	}
+
+	if s := newTaskResultSummarizer(b, ts, nativeSummarizer); s != nil {
 		summarizers = append(summarizers, s)
 	}
 
 	if s := newPolicyEvaluationSummarizer(b, ts); s != nil {
-		summarizers = append(summarizers, s)
-	}
-
-	if s := newNativeTaskSummarizer(b, ts); s != nil {
 		summarizers = append(summarizers, s)
 	}
 
